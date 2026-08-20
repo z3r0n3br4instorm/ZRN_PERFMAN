@@ -6,6 +6,8 @@
 
 #include "zrn_perf.h"
 #include <dirent.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <ctype.h>
 
 int read_comm(pid_t pid, char *out, size_t n)
@@ -46,6 +48,7 @@ int proc_add(pid_t pid)
     if (g_nprocs >= MAX_TRACKED) return -1;
 
     int i = g_nprocs++;
+    memset(&g_procs[i], 0, sizeof(g_procs[i]));
     g_procs[i].pid          = pid;
     g_procs[i].first_seen   = time(NULL);
     g_procs[i].defocus_time = 0;
@@ -71,6 +74,10 @@ void proc_remove_dead(void)
                 printf("[proctrack] -dead   pid=%-7d  comm=%s\n",
                        (int)g_procs[i].pid, g_procs[i].comm);
                 fflush(stdout);
+            }
+            if (g_procs[i].cpulimit_pid > 0) {
+                kill(g_procs[i].cpulimit_pid, SIGKILL);
+                waitpid(g_procs[i].cpulimit_pid, NULL, WNOHANG);
             }
             g_procs[i] = g_procs[--g_nprocs];
         } else {

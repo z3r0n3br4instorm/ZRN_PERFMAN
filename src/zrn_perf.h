@@ -69,12 +69,33 @@
 /* Audio monitoring */
 #define AUDIO_SCAN_INTERVAL_SEC 2
 
-/* Neural net (data collection + prediction) */
+/* Neural net (data collection + prediction + RL) */
 #define NN_INPUT_DIM          16
 #define NN_HIDDEN1            32
 #define NN_HIDDEN2            16
 #define NN_OUTPUT_DIM         64
 #define NN_PREWARM_TICK_MS    100
+
+typedef struct {
+    char  comm[64];
+    float prob;   /* 0.0 - 1.0 */
+} NNPrediction;
+
+typedef struct {
+    int          count;
+    NNPrediction top[5];
+    int          last_reward;       /* +1 (correct) or -1 (error/penalty) */
+    char         last_predicted[64];
+    char         last_actual[64];
+    float        last_conf;
+    float        last_loss;
+    int          total_correct;
+    int          total_predictions;
+    int          online_updates;
+} NNState;
+
+extern NNState g_nn_state;
+extern char    g_predicted_comm[64];
 
 /* Exempt list */
 #define MAX_EXEMPT            64
@@ -103,7 +124,11 @@ typedef struct {
     int      should_throttle;  /* 1 if main loop wants this stopped           */
     int      pulsing;          /* 1 if thread is currently sending SIGCONT    */
     long long next_pulse;      /* next time (ms) to pulse                     */
+    double   cpu_pct;
     
+    int      cpu_limit_pct;
+    pid_t    cpulimit_pid;
+
     pid_t    descendants[64];
     int      ndescendants;
 
@@ -147,9 +172,84 @@ typedef struct {
 /* -------------------------------------------------------------------------- */
 /* exempt entry (user-chosen from TUI)                                         */
 /* -------------------------------------------------------------------------- */
+#define LIMITS_PATH "/home/zerone/.zrnperformancelimits"
+
+typedef struct {
+    char     comm[64];
+    int      limit_pct;
+} LimitEntry;
+
 typedef struct {
     char     comm[64];
 } ExemptEntry;
+
+/* -------------------------------------------------------------------------- */
+/* power_source.c  -  direct AC/battery detection (no TLP)                    */
+/* -------------------------------------------------------------------------- */
+int power_on_ac(void);
+
+/* -------------------------------------------------------------------------- */
+/* cpu_power.c  -  CPU governor/frequency management by AC/battery state      */
+/* -------------------------------------------------------------------------- */
+#define CPU_MIN_FREQ_ON_AC_KHZ   1500000
+#define CPU_MAX_FREQ_ON_AC_KHZ   2300000
+#define CPU_GOVERNOR_ON_AC       "performance"
+#define CPU_MIN_FREQ_ON_BAT_KHZ  400000
+#define CPU_MAX_FREQ_ON_BAT_KHZ  900000
+#define CPU_GOVERNOR_ON_BAT      "powersave"
+#define CPU_POWER_SCAN_INTERVAL_SEC 2
+
+void cpu_power_init(void);
+void cpu_power_tick(void);
+
+/* HDD spin-down (battery only) */
+#define HDD_IDLE_TIMEOUT_SEC  30
+#define HDD_SCAN_INTERVAL_SEC 2
+
+typedef struct {
+    char     device_path[64];   /* e.g. /dev/sda                          */
+    char     stat_name[32];     /* e.g. "sda", as it appears in diskstats */
+    int      on_ac;
+    int      standby;           /* 1 = we've put the drive in standby     */
+    unsigned long long last_io_ticks;
+    time_t   last_activity;
+} HddMonState;
+
+extern HddMonState g_hddmon;
+void hddmon_init(void);
+void hddmon_tick(void);
+
+#define RAPIDBOOST_CPU_THRESH_BAT  70.0
+#define RAPIDBOOST_CPU_THRESH_AC   95.0
+#define RAPIDBOOST_FREQ_PCT_BAT    50
+#define RAPIDBOOST_FREQ_AC_KHZ     2600000
+#define RAPIDBOOST_DISP_PCT        25
+#define BOOST_LOG_PATH "/tmp/boostml.csv"
+
+typedef struct {
+    /* RapidBoost */
+    int      rapidboost_active;
+    int      rapidboost_on_ac;
+    unsigned long max_freq_khz;
+    unsigned long base_freq_khz;
+    unsigned long cur_freq_khz;
+    unsigned long saved_scaling_max_khz;
+    char     kbd_brightness_path[256];
+    char     disp_brightness_path[256];
+    char     disp_max_brightness_path[256];
+    int      saved_kbd_brightness;
+    int      disp_max_brightness;
+    int      saved_disp_brightness;
+    int      disp_dimmed;
+    unsigned long boost_target_khz;
+    time_t   rapidboost_start;
+    double   focused_cpu_pct;
+
+    /* BoostML */
+    int      boostml_collecting;
+    int      ml_prediction;
+    int      gpu_available;
+} DynBoostState;
 
 /* -------------------------------------------------------------------------- */
 /* global state (defined in main.c)                                            */
@@ -181,6 +281,20 @@ extern int                   g_ngpu_procs;
 /* User-exempted app types */
 extern ExemptEntry           g_exempt[MAX_EXEMPT];
 extern int                   g_nexempt;
+
+/* CPU limits */
+extern LimitEntry            g_limits[MAX_EXEMPT];
+extern int                   g_nlimits;
+
+/* -------------------------------------------------------------------------- */
+/* limits.c                                                                    */
+/* -------------------------------------------------------------------------- */
+void limits_load(const char *path);
+void limits_save(const char *path);
+void limit_add(const char *comm, int limit_pct);
+void limit_remove(const char *comm);
+int  limit_check(const char *comm);
+void limits_apply_all(void);
 
 /* -------------------------------------------------------------------------- */
 /* profile.c                                                                   */
@@ -215,6 +329,7 @@ void throttle_init(void);
 void throttle_shutdown(void);
 void throttle_apply(pid_t focused_pid);
 void throttle_unthrottle_all(void);
+int  throttle_get_tick(TrackedProc *p);
 void throttle_enqueue_job(pid_t pid, int action);
 int  is_comm_exempt(const char *comm, const char *focused_comm);
 
@@ -248,7 +363,11 @@ void audio_cleanup(void);
 /* -------------------------------------------------------------------------- */
 void nn_record_features(const SwitchEvent *ev, int switch_rate_1min);
 int  nn_predict_next(const char *current_comm, char *predicted_out, size_t n);
+void nn_feedback(const char *actual_comm);
 int  nn_load_weights(const char *path);
+int  nn_save_weights(const char *path);
+int  nn_gpu_init(Display *dpy);
+void nn_gpu_shutdown(void);
 
 /* -------------------------------------------------------------------------- */
 /* exempt.c                                                                    */
@@ -273,3 +392,10 @@ int  tui_handle_input(void);
 void gui_init(int *argc, char ***argv);
 void gui_run(void);
 void gui_shutdown(void);
+
+#define DYNBOOST_SCAN_SEC 1
+extern DynBoostState g_dynboost;
+void dynboost_init(Display *dpy);
+void dynboost_tick(pid_t focused_pid);
+void dynboost_shutdown(void);
+void dynboost_notify(const char *summary, const char *body);

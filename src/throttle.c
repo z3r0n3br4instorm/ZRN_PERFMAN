@@ -39,10 +39,16 @@ static void signal_tree(TrackedProc *p, int sig)
     }
 }
 
-static void stop_tree(TrackedProc *p) { signal_tree(p, SIGSTOP); }
-static void cont_tree(TrackedProc *p) { signal_tree(p, SIGCONT); }
+static void stop_tree(TrackedProc *p) { 
+    if (p->cpulimit_pid > 0) kill(p->cpulimit_pid, SIGSTOP);
+    signal_tree(p, SIGSTOP); 
+}
+static void cont_tree(TrackedProc *p) { 
+    signal_tree(p, SIGCONT); 
+    if (p->cpulimit_pid > 0) kill(p->cpulimit_pid, SIGCONT);
+}
 
-static int get_tick_for_proc(TrackedProc *p)
+int throttle_get_tick(TrackedProc *p)
 {
     if (p->prewarm) return NN_PREWARM_TICK_MS;
     
@@ -80,10 +86,20 @@ static void *throttle_worker(void *arg)
             if (p->should_throttle && !p->throttled) {
                 stop_tree(p);
                 p->throttled = 1;
-                p->next_pulse = now + get_tick_for_proc(p);
+                p->next_pulse = now + throttle_get_tick(p);
+                if (!g_tui_mode && !g_gui_mode) {
+                    printf("[tickle] PID %d (%s) SUSPENDED. Next pulse in %d ms.\n",
+                           (int)p->pid, p->comm, throttle_get_tick(p));
+                    fflush(stdout);
+                }
             } else if (!p->should_throttle && p->throttled) {
                 cont_tree(p);
                 p->throttled = 0;
+                if (!g_tui_mode && !g_gui_mode) {
+                    printf("[tickle] PID %d (%s) RESUMED (exempt or focused).\n",
+                           (int)p->pid, p->comm);
+                    fflush(stdout);
+                }
             }
 
             if (p->throttled && now >= p->next_pulse) {
@@ -101,7 +117,7 @@ static void *throttle_worker(void *arg)
                 if (p->throttled && p->pulsing) {
                     stop_tree(p);
                     p->pulsing = 0;
-                    p->next_pulse = now + get_tick_for_proc(p) - THROTTLE_QUANTUM_MS;
+                    p->next_pulse = now + throttle_get_tick(p) - THROTTLE_QUANTUM_MS;
                 }
             }
         } else {
@@ -142,12 +158,6 @@ void throttle_apply(pid_t focused_pid)
         default:            grace_sec = GRACE_NOMINAL_SEC; break;
     }
 
-    char predicted_comm[64] = "";
-    if (g_experimental) {
-        int fi = proc_find(focused_pid);
-        if (fi >= 0) nn_predict_next(g_procs[fi].comm, predicted_comm, sizeof(predicted_comm));
-    }
-
     const char *focused_comm = "?";
     int f_idx = proc_find(focused_pid);
     if (f_idx >= 0) focused_comm = g_procs[f_idx].comm;
@@ -163,7 +173,7 @@ void throttle_apply(pid_t focused_pid)
             continue;
         }
 
-        if (predicted_comm[0] && strcmp(p->comm, predicted_comm) == 0) {
+        if (g_experimental && g_predicted_comm[0] && strcmp(p->comm, g_predicted_comm) == 0) {
             p->should_throttle = 1;
             p->prewarm = 1;
             continue;

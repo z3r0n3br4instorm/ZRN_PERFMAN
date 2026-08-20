@@ -5,6 +5,9 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "zrn_perf.h"
+#include <glob.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 const char *mode_name(PerfMode m)
 {
@@ -17,31 +20,12 @@ const char *mode_name(PerfMode m)
     return "Unknown";
 }
 
-#include <ctype.h>
-
+/* AC/battery is read directly (see power_source.c) rather than via TLP:
+ * TLP's own change-detection cache could get stuck and silently skip
+ * re-evaluating on a real power source change. */
 PerfMode profile_detect_system(void)
 {
-    FILE *f = popen("tlp-stat -s 2>/dev/null", "r");
-    char line[256];
-    char profile_str[64] = "";
-
-    if (f) {
-        while (fgets(line, sizeof(line), f)) {
-            if (strncmp(line, "TLP profile    =", 16) == 0) {
-                char *p = line + 16;
-                while (*p && isspace((unsigned char)*p)) p++;
-                strncpy(profile_str, p, sizeof(profile_str)-1);
-                break;
-            }
-        }
-        pclose(f);
-    }
-    
-    if (strstr(profile_str, "power-saver") || strstr(profile_str, "powersave") || strstr(profile_str, "battery")) return MODE_HIGH;
-    if (strstr(profile_str, "performance")) return MODE_NOMINAL;
-    if (strstr(profile_str, "balanced")) return MODE_MODERATE;
-    
-    return MODE_NOMINAL;
+    return power_on_ac() ? MODE_NOMINAL : MODE_HIGH;
 }
 
 void profile_init(void)

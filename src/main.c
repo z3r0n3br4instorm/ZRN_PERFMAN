@@ -32,6 +32,8 @@ int                   g_tui_mode      = 1;
 int                   g_gui_mode      = 0;
 int                   g_monitor_only  = 0;
 
+DynBoostState         g_dynboost;
+
 static int s_lock_fd = -1;
 
 static int try_acquire_lock(void)
@@ -98,6 +100,9 @@ static void usage(const char *argv0)
         "  --daemon                     Run headless (no TUI, log to stdout)\n"
         "  --gui                        GTK3 graphical interface\n"
         "  --allow-experimental-features Enable neural-net window prediction\n"
+        "  --predict, --status          Display next window predictions & RL probabilities\n"
+        "  --set-limit comm:pct         Set CPU limit for process name (e.g. firefox:30)\n"
+        "  --remove-limit comm          Remove CPU limit for process name\n"
         "  -h, --help                   Show this message\n",
         argv0);
 }
@@ -108,19 +113,106 @@ int main(int argc, char *argv[])
         {"daemon",                       no_argument, NULL, 'd'},
         {"gui",                          no_argument, NULL, 'g'},
         {"allow-experimental-features",  no_argument, NULL, 'x'},
+        {"predict",                      no_argument, NULL, 's'},
+        {"status",                       no_argument, NULL, 's'},
         {"pairing",                      no_argument, NULL, 'p'},
         {"mode",                         required_argument, NULL, 'm'},
+        {"set-limit",                    required_argument, NULL, 'l'},
+        {"remove-limit",                 required_argument, NULL, 'r'},
         {"help",                         no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "dgxpm:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "dgxspm:l:r:h", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'd': g_tui_mode = 0; g_gui_mode = 0; break;
             case 'g': g_gui_mode = 1; g_tui_mode = 0; break;
             case 'x': g_experimental = 1; break;
+            case 's': {
+                g_experimental = 1;
+                if (nn_load_weights(MODEL_WEIGHTS_PATH) != 0) {
+                    fprintf(stderr, "[zrn] Could not load model weights from %s\n", MODEL_WEIGHTS_PATH);
+                    return 1;
+                }
+                Display *dpy = XOpenDisplay(NULL);
+                if (!dpy) {
+                    fprintf(stderr, "[zrn] Cannot open X display.\n");
+                    return 1;
+                }
+                nn_gpu_init(dpy);
+                Atom net_active = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", True);
+                Atom net_wm_pid = XInternAtom(dpy, "_NET_WM_PID", True);
+                Window root = DefaultRootWindow(dpy);
+                Window act_win = xwin_active(dpy, root, net_active);
+                pid_t act_pid = xwin_pid(dpy, act_win, net_wm_pid);
+
+                char act_comm[64] = "unknown";
+                if (act_pid > 0) {
+                    char proc_path[64];
+                    snprintf(proc_path, sizeof(proc_path), "/proc/%d/comm", (int)act_pid);
+                    FILE *cf = fopen(proc_path, "r");
+                    if (cf) {
+                        if (fgets(act_comm, sizeof(act_comm), cf)) {
+                            char *nl = strchr(act_comm, '\n');
+                            if (nl) *nl = '\0';
+                        }
+                        fclose(cf);
+                    }
+                }
+
+                char pred_comm[64] = "";
+                nn_predict_next(act_comm, pred_comm, sizeof(pred_comm));
+
+                printf("=== ZrnPerformanceMgmnt Window Predictor (GPU RL) ===\n");
+                printf("  Focused Window:    %s (PID %d)\n", act_comm, (int)act_pid);
+                printf("  Pre-warmed Target: %s\n", pred_comm[0] ? pred_comm : "None");
+                printf("\n--- Next Window Probabilities ---\n");
+                for (int i = 0; i < g_nn_state.count; i++) {
+                    int bars = (int)(g_nn_state.top[i].prob * 20.0f);
+                    char bar_str[24];
+                    memset(bar_str, ' ', 20);
+                    for (int b = 0; b < bars && b < 20; b++) bar_str[b] = '=';
+                    bar_str[20] = '\0';
+                    int is_pred = (strcmp(g_nn_state.top[i].comm, pred_comm) == 0);
+                    printf("  %d. %-16.16s [%s] %5.1f%%%s\n",
+                           i + 1, g_nn_state.top[i].comm, bar_str,
+                           g_nn_state.top[i].prob * 100.0f,
+                           is_pred ? "  <- [Pre-warmed]" : "");
+                }
+                printf("\n--- Reinforcement Learning Online Status ---\n");
+                if (g_nn_state.total_predictions > 0) {
+                    float acc = (float)g_nn_state.total_correct / (float)g_nn_state.total_predictions * 100.0f;
+                    printf("  Last Feedback:     %s (Target: %s, Pred: %s, Loss: %.4f)\n",
+                           g_nn_state.last_reward > 0 ? "Reward (+1.0 Correct)" : "Penalty (-1.0 Corrected)",
+                           g_nn_state.last_actual, g_nn_state.last_predicted, g_nn_state.last_loss);
+                    printf("  Online Accuracy:   %.1f%% (%d / %d)\n",
+                           acc, g_nn_state.total_correct, g_nn_state.total_predictions);
+                } else {
+                    printf("  Model online and active (weights loaded from %s)\n", MODEL_WEIGHTS_PATH);
+                }
+                nn_gpu_shutdown();
+                XCloseDisplay(dpy);
+                return 0;
+            }
             case 'p': g_pairing_mode = 1; break;
+            case 'l': {
+                char comm[64];
+                int pct = 0;
+                if (sscanf(optarg, "%63[^:]:%d", comm, &pct) == 2) {
+                    limits_load(LIMITS_PATH);
+                    limit_add(comm, pct);
+                    printf("CPU limit for %s set to %d%%\n", comm, pct);
+                } else {
+                    fprintf(stderr, "Error: format must be comm:percent (e.g. alacritty:50)\n");
+                }
+                return 0;
+            }
+            case 'r':
+                limits_load(LIMITS_PATH);
+                limit_remove(optarg);
+                printf("CPU limit for %s removed.\n", optarg);
+                return 0;
             case 'm':
                 if (strcasecmp(optarg, "none") == 0) g_mode = MODE_NONE;
                 else if (strcasecmp(optarg, "nominal") == 0) g_mode = MODE_NOMINAL;
@@ -147,6 +239,7 @@ int main(int argc, char *argv[])
 
     /* Load configuration */
     exempt_load(EXEMPT_PATH);
+    limits_load(LIMITS_PATH);
 
     if (g_experimental && !g_monitor_only) {
         if (nn_load_weights(MODEL_WEIGHTS_PATH) == 0) {
@@ -190,6 +283,12 @@ int main(int argc, char *argv[])
 
     /* Initialize background systems */
     audio_init();
+    hddmon_init();
+    cpu_power_init();
+    dynboost_init(dpy);
+    if (g_experimental) {
+        nn_gpu_init(dpy);
+    }
     if (!g_monitor_only) {
         throttle_init();
     }
@@ -202,6 +301,13 @@ int main(int argc, char *argv[])
     g_focused_pid      = xwin_pid(dpy, focused_win, net_wm_pid);
     time_t focus_start  = time(NULL);
 
+    if (g_experimental) {
+        const char *init_comm = comm_for_pid(g_focused_pid);
+        if (init_comm && init_comm[0] != '?') {
+            nn_predict_next(init_comm, g_predicted_comm, sizeof(g_predicted_comm));
+        }
+    }
+
     int x_fd = ConnectionNumber(dpy);
 
     time_t last_profile_reload = time(NULL);
@@ -211,6 +317,9 @@ int main(int argc, char *argv[])
     time_t last_gpu_scan       = time(NULL);
     time_t last_pair_update    = time(NULL);
     time_t last_audio_scan     = time(NULL);
+    time_t last_dynboost_scan  = time(NULL);
+    time_t last_hdd_scan       = time(NULL);
+    time_t last_cpu_power_scan = time(NULL);
 
     /* Init UI */
     if (g_tui_mode) {
@@ -251,6 +360,10 @@ int main(int argc, char *argv[])
                     if (!g_monitor_only) {
                         switch_record(g_focused_pid, from_comm,
                                       cpid, to_comm, duration_ms);
+                        if (g_experimental) {
+                            nn_feedback(to_comm);
+                            nn_predict_next(to_comm, g_predicted_comm, sizeof(g_predicted_comm));
+                        }
                     }
 
                     if (!g_tui_mode && !g_gui_mode)
@@ -296,7 +409,7 @@ int main(int argc, char *argv[])
 
         if (!g_monitor_only) {
             /* System power profile monitor */
-            if (now - last_sys_check >= 30) {
+            if (now - last_sys_check >= 2) {
                 PerfMode sys_mode = profile_detect_system();
                 if (sys_mode != last_sys_mode) {
                     last_sys_mode = sys_mode;
@@ -325,6 +438,7 @@ int main(int argc, char *argv[])
                     }
                 }
                 exempt_load(EXEMPT_PATH);
+    limits_load(LIMITS_PATH);
                 last_profile_reload = now;
             }
         } else {
@@ -332,6 +446,7 @@ int main(int argc, char *argv[])
             if (now - last_profile_reload >= PROFILE_RELOAD_SEC) {
                 profile_reload();
                 exempt_load(EXEMPT_PATH);
+    limits_load(LIMITS_PATH);
                 last_profile_reload = now;
             }
         }
@@ -364,9 +479,39 @@ int main(int argc, char *argv[])
         if (!g_monitor_only) {
             /* Apply throttle policy */
             throttle_apply(g_focused_pid);
+            limits_apply_all();
 
             /* Apply GPU throttle */
             gpu_throttle_apply(g_focused_pid);
+        } else {
+            /* Monitor mode: compute throttle state for display purposes only.
+             * We call throttle_apply() to evaluate the policy (sets
+             * should_throttle, defocus_time, prewarm) but since the worker
+             * thread isn't running we directly mirror should_throttle into
+             * throttled so the GUI/TUI shows the correct status.             */
+            throttle_apply(g_focused_pid);
+            limits_apply_all();
+            gpu_throttle_apply(g_focused_pid);
+            for (int i = 0; i < g_nprocs; i++)
+                g_procs[i].throttled = g_procs[i].should_throttle;
+        }
+
+        /* Dynamic Boost */
+        if (now - last_dynboost_scan >= DYNBOOST_SCAN_SEC) {
+            dynboost_tick(g_focused_pid);
+            last_dynboost_scan = now;
+        }
+
+        /* HDD spin-down (battery only) */
+        if (now - last_hdd_scan >= HDD_SCAN_INTERVAL_SEC) {
+            hddmon_tick();
+            last_hdd_scan = now;
+        }
+
+        /* CPU governor/frequency by AC/battery state */
+        if (now - last_cpu_power_scan >= CPU_POWER_SCAN_INTERVAL_SEC) {
+            cpu_power_tick();
+            last_cpu_power_scan = now;
         }
 
         /* TUI redraw */
@@ -378,6 +523,11 @@ int main(int argc, char *argv[])
     /* ---- clean shutdown ---- */
     if (g_tui_mode) tui_shutdown();
     if (g_gui_mode) gui_shutdown();
+
+    dynboost_shutdown();
+    if (g_experimental) {
+        nn_gpu_shutdown();
+    }
 
     if (g_monitor_only) {
         audio_cleanup();

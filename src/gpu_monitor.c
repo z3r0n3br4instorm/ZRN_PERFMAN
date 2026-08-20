@@ -119,7 +119,7 @@ void gpu_throttle_apply(pid_t focused_pid)
 
         if (gp->pid == focused_pid || is_comm_exempt(gp->comm, focused_comm) || gp->pid == getpid()) {
             if (gp->throttled) {
-                kill(gp->pid, SIGCONT);
+                if (!g_monitor_only) kill(gp->pid, SIGCONT);
                 gp->throttled = 0;
                 gp->pulsing = 0;
             }
@@ -130,15 +130,15 @@ void gpu_throttle_apply(pid_t focused_pid)
         if (ti >= 0 && g_procs[ti].throttled) continue;
 
         if (!gp->throttled) {
-            kill(gp->pid, SIGSTOP);
+            if (!g_monitor_only) kill(gp->pid, SIGSTOP);
             gp->throttled = 1;
             gp->next_pulse = now + TICK_MODERATE_MS;
         } else if (now >= gp->next_pulse && !gp->pulsing) {
-            kill(gp->pid, SIGCONT);
+            if (!g_monitor_only) kill(gp->pid, SIGCONT);
             gp->pulsing = 1;
             gp->next_pulse = now + THROTTLE_QUANTUM_MS;
         } else if (gp->pulsing && now >= gp->next_pulse) {
-            kill(gp->pid, SIGSTOP);
+            if (!g_monitor_only) kill(gp->pid, SIGSTOP);
             gp->pulsing = 0;
             gp->next_pulse = now + TICK_MODERATE_MS - THROTTLE_QUANTUM_MS;
         }

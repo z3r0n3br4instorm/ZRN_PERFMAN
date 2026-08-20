@@ -15,7 +15,7 @@ CFLAGS  := -std=c11 -Wall -Wextra -Wpedantic -O2 \
 LDFLAGS := $(shell pkg-config --libs x11) \
            $(shell pkg-config --libs ncursesw) \
            $(shell pkg-config --libs libpulse) \
-           -lm
+           -lm -lGL
 
 # GTK3 flags (only used for `make gui`)
 GTK_CFLAGS  := $(shell pkg-config --cflags gtk+-3.0 2>/dev/null)
@@ -31,13 +31,21 @@ SRCS    := $(SRCDIR)/main.c \
            $(SRCDIR)/gpu_monitor.c \
            $(SRCDIR)/neural_predict.c \
            $(SRCDIR)/exempt.c \
+           $(SRCDIR)/limits.c \
            $(SRCDIR)/audio_monitor.c \
+           $(SRCDIR)/hdd_monitor.c \
+           $(SRCDIR)/power_source.c \
+           $(SRCDIR)/cpu_power.c \
            $(SRCDIR)/tui.c \
+           $(SRCDIR)/dynboost.c \
            $(SRCDIR)/gui.c
 OBJS    := $(SRCS:.c=.o)
 TARGET  := zrn_perfd
 
-.PHONY: all gui clean install run run-gui daemon
+.PHONY: all gui clean install run run-gui daemon train
+
+train:
+	python3 tools/train_model.py
 
 all: $(TARGET)
 
